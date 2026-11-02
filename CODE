@@ -1,0 +1,270 @@
+#include <U8g2lib.h>
+
+U8G2_SSD1306_128X64_NONAME_1_SW_I2C u8g2(U8G2_R0, 13, 12, U8X8_PIN_NONE);
+
+#define TRIG 10
+#define ECHO 11
+#define ENA  5
+#define IN1  2
+#define IN2  3
+#define ENB  6
+#define IN3  7
+#define IN4  8
+
+#define DIST_EARLY   300
+#define DIST_WARN    150
+#define DIST_SLOW     60
+#define HYSTERESIS    15
+
+#define FULL_SPEED   120
+#define SPEED_EARLY  100
+#define SPEED_WARN    75
+#define SPEED_SLOW    50
+#define STEP_UP        2
+#define STEP_DOWN      8   // brake faster than accelerate
+
+#define SENSOR_INTERVAL   50
+#define MOTOR_INTERVAL    10
+#define OLED_INTERVAL    500
+#define RECOVER_INTERVAL 120
+
+#define ALPHA 0.3f
+
+// ── State machine ──
+typedef enum {
+  ZONE_CLEAR,
+  ZONE_EARLY,
+  ZONE_WARN,
+  ZONE_SLOW
+} Zone;
+
+Zone          currentZone   = ZONE_CLEAR;
+Zone          prevZone      = ZONE_CLEAR;
+int           currentSpeed  = FULL_SPEED;
+int           targetSpeed   = FULL_SPEED;
+float         smoothDist    = 400.0f;
+long          lastValid     = 400;
+long          distance      = 400;
+bool          wasSlowed     = false;
+
+unsigned long lastSensorTime  = 0;
+unsigned long lastMotorTime   = 0;
+unsigned long lastOledTime    = 0;
+unsigned long lastRecoverTime = 0;
+
+// ── OLED display values ──
+long    dispDistance = 400;
+int     dispPercent  = 100;
+uint8_t dispZoneCode = 0;
+
+// ─────────────────────────────────────────
+void setMotorSpeed(int spd) {
+  analogWrite(ENA, spd);
+  analogWrite(ENB, spd);
+}
+
+// ─────────────────────────────────────────
+long getDistance() {
+  digitalWrite(TRIG, LOW);
+  delayMicroseconds(4);
+  digitalWrite(TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG, LOW);
+
+  long duration = pulseIn(ECHO, HIGH, 40000);
+  if (duration == 0) return lastValid;
+
+  long raw = duration * 0.034 / 2;
+
+  // Sanity check — reject impossible jump
+  if (abs(raw - lastValid) > 80) return lastValid;
+  if (raw < 2 || raw > 400)      return lastValid;
+
+  // Exponential moving average
+  smoothDist = (ALPHA * raw) + ((1.0f - ALPHA) * smoothDist);
+  lastValid  = (long)smoothDist;
+  return lastValid;
+}
+
+// ─────────────────────────────────────────
+// Hysteresis state machine
+Zone getZone(long dist) {
+  switch (currentZone) {
+    case ZONE_CLEAR:
+      if (dist < DIST_EARLY - HYSTERESIS) return ZONE_EARLY;
+      break;
+    case ZONE_EARLY:
+      if (dist > DIST_EARLY + HYSTERESIS) return ZONE_CLEAR;
+      if (dist < DIST_WARN  - HYSTERESIS) return ZONE_WARN;
+      break;
+    case ZONE_WARN:
+      if (dist > DIST_WARN  + HYSTERESIS) return ZONE_EARLY;
+      if (dist < DIST_SLOW  - HYSTERESIS) return ZONE_SLOW;
+      break;
+    case ZONE_SLOW:
+      if (dist > DIST_SLOW  + HYSTERESIS) return ZONE_WARN;
+      break;
+  }
+  return currentZone;
+}
+
+// ─────────────────────────────────────────
+void updateMotor() {
+  switch (currentZone) {
+    case ZONE_CLEAR: targetSpeed = FULL_SPEED;   break;
+    case ZONE_EARLY: targetSpeed = SPEED_EARLY;  break;
+    case ZONE_WARN:  targetSpeed = SPEED_WARN;   break;
+    case ZONE_SLOW:  targetSpeed = SPEED_SLOW;   break;
+  }
+
+  if (currentSpeed > targetSpeed) {
+    currentSpeed -= STEP_DOWN;
+    if (currentSpeed < targetSpeed) currentSpeed = targetSpeed;
+  } else if (currentSpeed < targetSpeed) {
+    currentSpeed += STEP_UP;
+    if (currentSpeed > targetSpeed) currentSpeed = targetSpeed;
+  }
+
+  setMotorSpeed(currentSpeed);
+}
+
+// ─────────────────────────────────────────
+void drawPage() {
+  u8g2.setDrawColor(1);
+  u8g2.drawBox(0, 0, 128, 12);
+  u8g2.setDrawColor(0);
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(8, 10, "SPEED CONTROL SYSTEM");
+  u8g2.setDrawColor(1);
+
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 23, "DIST:");
+  u8g2.setFont(u8g2_font_logisoso16_tf);
+
+  if (dispDistance >= 400) {
+    u8g2.drawStr(34, 28, "CLEAR");
+  } else {
+    char buf[8];
+    ltoa(dispDistance, buf, 10);
+    u8g2.drawStr(34, 28, buf);
+    u8g2.setFont(u8g2_font_6x10_tf);
+    int offset = (dispDistance >= 100) ? 64 :
+                 (dispDistance >= 10)  ? 54 : 44;
+    u8g2.drawStr(34 + offset, 28, "cm");
+  }
+
+  u8g2.drawHLine(0, 31, 128);
+
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 41, "SPD:");
+  u8g2.drawFrame(28, 33, 80, 9);
+  int fillW = map(dispPercent, 0, 100, 0, 78);
+  if (fillW > 0) u8g2.drawBox(29, 34, fillW, 7);
+  char pct[5];
+  itoa(dispPercent, pct, 10);
+  strcat(pct, "%");
+  u8g2.drawStr(112, 41, pct);
+
+  u8g2.drawHLine(0, 44, 128);
+
+  const char* zoneStr;
+  bool invert = false;
+  switch (currentZone) {
+    case ZONE_CLEAR: zoneStr = "ROAD CLEAR";    break;
+    case ZONE_EARLY: zoneStr = "CAUTION AHEAD"; break;
+    case ZONE_WARN:  zoneStr = "SLOWING DOWN";  break;
+    case ZONE_SLOW:  zoneStr = "ON BREAKER";
+                     invert  = true;             break;
+  }
+
+  if (invert) {
+    u8g2.drawBox(0, 46, 128, 18);
+    u8g2.setDrawColor(0);
+  } else {
+    u8g2.drawFrame(0, 46, 128, 18);
+  }
+
+  u8g2.setFont(u8g2_font_7x13B_tf);
+  int xPos = (128 - (int)(strlen(zoneStr) * 7)) / 2;
+  u8g2.drawStr(xPos, 60, zoneStr);
+  u8g2.setDrawColor(1);
+}
+
+// ─────────────────────────────────────────
+void setup() {
+  pinMode(TRIG,        OUTPUT);
+  pinMode(ECHO,        INPUT);
+  pinMode(ENA,         OUTPUT);
+  pinMode(IN1,         OUTPUT);
+  pinMode(IN2,         OUTPUT);
+  pinMode(ENB,         OUTPUT);
+  pinMode(IN3,         OUTPUT);
+  pinMode(IN4,         OUTPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  digitalWrite(TRIG, LOW);
+  digitalWrite(IN1,  LOW);
+  digitalWrite(IN2,  HIGH);
+  digitalWrite(IN3,  LOW);
+  digitalWrite(IN4,  HIGH);
+
+  setMotorSpeed(FULL_SPEED);
+
+  Serial.begin(9600);
+  u8g2.begin();
+
+  // Splash
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_7x13B_tf);
+    u8g2.drawStr(22, 14, "SMART SPEED");
+    u8g2.drawStr(16, 28, "CONTROL SYSTEM");
+    u8g2.drawHLine(0, 32, 128);
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(20, 44, "2 Motor System");
+    u8g2.drawStr(10, 56, "Initializing...");
+  } while (u8g2.nextPage());
+
+  // Sensor warmup
+  for (int i = 0; i < 10; i++) {
+    getDistance();
+    delay(50);
+  }
+
+  Serial.println(F("=== Ready ==="));
+}
+
+// ─────────────────────────────────────────
+void loop() {
+  unsigned long now = millis();
+
+  // ── Task 1: Sensor (every 50ms) ──
+  if (now - lastSensorTime >= SENSOR_INTERVAL) {
+    distance    = getDistance();
+    currentZone = getZone(distance);
+    lastSensorTime = now;
+
+    if (currentZone != ZONE_CLEAR) {
+      wasSlowed = true;
+      digitalWrite(LED_BUILTIN, HIGH);
+    } else {
+      digitalWrite(LED_BUILTIN, LOW);
+    }
+  }
+
+  // ── Task 2: Motor (every 10ms) ──
+  if (now - lastMotorTime >= MOTOR_INTERVAL) {
+    updateMotor();
+    lastMotorTime = now;
+  }
+
+  // ── Task 3: Display (every 500ms) ──
+  if (now - lastOledTime >= OLED_INTERVAL) {
+    dispDistance = distance;
+    dispPercent  = map(currentSpeed, 0, FULL_SPEED, 0, 100);
+    if (dispPercent > 100) dispPercent = 100;
+    u8g2.firstPage();
+    do { drawPage(); } while (u8g2.nextPage());
+    lastOledTime = now;
+  }
+}
